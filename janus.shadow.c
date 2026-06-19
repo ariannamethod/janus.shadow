@@ -23,6 +23,7 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
+#include <stdint.h>
 
 /* — architecture — */
 #define VMAX     512
@@ -37,9 +38,6 @@
 #define TR_DECAY    0.965f
 #define TR_BOOST    0.45f
 #define MEM_DECAY   0.92f
-#define BETA1       0.9f
-#define BETA2       0.999f
-#define ADAM_EPS    1e-8f
 #define LR          0.0015f
 
 /* — logit composition — */
@@ -99,14 +97,55 @@ static float trpos_c[CTX][VMAX];
 static float gate_c;
 static float gate_pos[CTX];
 
-/* — Adam state — */
+/* — Chuck optimizer: per-tensor m/v moment buffers — */
 static float mE[VMAX][D], vE[VMAX][D];
 static float mWq[D][D], vWqs[D][D];
 static float mWk[D][D], vWks[D][D];
 static float mWv[D][D], vWvs[D][D];
 static float mWo[D][D], vWos[D][D];
 static float mWu[D][VMAX], vWu[D][VMAX];
-static int   adam_t = 0;
+
+/* — Chuck optimizer state (vendored byte-faithful from notorch.h:161-201) — */
+#define NT_CHUCK_WINDOW       16
+#define NT_CHUCK_DAMP_LO      0.3f
+#define NT_CHUCK_DAMP_HI      2.0f
+#define NT_CHUCK_DAMP_DOWN    0.97f
+#define NT_CHUCK_DAMP_UP      1.03f
+#define NT_CHUCK_TREND_BRAKE  0.02f
+#define NT_CHUCK_TREND_PUSH  -0.02f
+#define NT_CHUCK_STAG_THRESH  0.001f
+#define NT_CHUCK_STAG_STEPS   8
+#define NT_CHUCK_NOISE_MAG    0.001f
+#define NT_CHUCK_NOISE_DECAY  0.9f
+#define NT_CHUCK_FREEZE_THRESH 0.01f
+#define NT_CHUCK_MACRO_INT    1000
+#define NT_CHUCK_MACRO_PAT    3
+#define NT_CHUCK_MACRO_DECAY  0.5f
+#define NT_CHUCK_MEAN_REVERT  0.999f
+
+typedef struct {
+    float grad_hist[NT_CHUCK_WINDOW];
+    float dampen;
+    int   frozen, pos, full, stag, t;
+} chuck_param;
+
+typedef struct {
+    float loss_hist[NT_CHUCK_WINDOW];
+    float dampen, noise, loss_ema, macro_ema, best_macro, lr_scale;
+    int   macro_stag, global_step, pos, full, stag, initialized;
+} chuck_state;
+
+static chuck_state cstate;
+static chuck_param cp_E, cp_Wq, cp_Wk, cp_Wv, cp_Wo, cp_Wu;
+static uint32_t chuck_rng = 2463534242u;
+/* Chuck-lite: drop level-4 param-freeze + level-3 stagnation-noise, which stall a
+ * gated tiny model whose neural gradients are intentionally small during bootstrap.
+ * The adaptive LR (levels 1/2/5 dampen + macro lr_scale) stays — that part helps.
+ * Full byte-faithful Chuck is preserved for -DCHUCK_LITE=0 (the notorch upgrade path). */
+#ifndef CHUCK_LITE
+#define CHUCK_LITE 1
+#endif
+static int chuck_lite = CHUCK_LITE;
 
 /* — gradient accumulators — */
 static float gE[VMAX][D];
@@ -292,7 +331,12 @@ static void model_init(void) {
     memset(mWv, 0, sizeof mWv); memset(vWvs, 0, sizeof vWvs);
     memset(mWo, 0, sizeof mWo); memset(vWos, 0, sizeof vWos);
     memset(mWu, 0, sizeof mWu); memset(vWu, 0, sizeof vWu);
-    adam_t = 0;
+
+    memset(&cstate, 0, sizeof cstate);
+    memset(&cp_E, 0, sizeof cp_E);   memset(&cp_Wq, 0, sizeof cp_Wq);
+    memset(&cp_Wk, 0, sizeof cp_Wk); memset(&cp_Wv, 0, sizeof cp_Wv);
+    memset(&cp_Wo, 0, sizeof cp_Wo); memset(&cp_Wu, 0, sizeof cp_Wu);
+    chuck_rng = 2463534242u;
 }
 
 /* ============================================================ */
@@ -618,29 +662,151 @@ static void backward(void) {
 }
 
 /* ============================================================ */
-/*  Adam update                                                  */
+/*  Chuck optimizer (vendored byte-faithful from notorch.c:2301-2532)  */
+/*  Self-aware Adam: theta -= (lr*S*lambda*lambda_l)*mhat/(sqrt(vhat)+  */
+/*  eps) + noise. nt_tape_chuck_step is tape-coupled, so the per-tensor */
+/*  math is inlined here over our own gradient arrays.                  */
 /* ============================================================ */
 
-static void adam_apply(float *w, float *g, float *m, float *v, int n) {
-    float c1 = 1.0f - powf(BETA1, adam_t);
-    float c2 = 1.0f - powf(BETA2, adam_t);
-    for (int i = 0; i < n; i++) {
-        m[i] = BETA1 * m[i] + (1.0f - BETA1) * g[i];
-        v[i] = BETA2 * v[i] + (1.0f - BETA2) * g[i] * g[i];
-        float mh = m[i] / c1;
-        float vh = v[i] / c2;
-        w[i] -= LR * mh / (sqrtf(vh) + ADAM_EPS);
+static float chuck_ring_avg(const float *buf, int pos, int full, int start, int count) {
+    int len = full ? NT_CHUCK_WINDOW : pos;
+    if (len == 0 || count == 0) return 0.0f;
+    float sum = 0.0f;
+    int actual = 0;
+    for (int i = 0; i < count && i < len; i++) {
+        int idx = (start + i) % NT_CHUCK_WINDOW;
+        if (idx < len || full) { sum += buf[idx]; actual++; }
+    }
+    return actual > 0 ? sum / actual : 0.0f;
+}
+
+static float chuck_randn(void) {
+    chuck_rng ^= chuck_rng << 13;
+    chuck_rng ^= chuck_rng >> 17;
+    chuck_rng ^= chuck_rng << 5;
+    return 2.0f * (float)(chuck_rng) / 4294967296.0f - 1.0f;
+}
+
+/* Level 1/3/9: global loss-trend dampen + stagnation noise + macro patience.
+ * Runs exactly once per optimizer step, before stepping the tensors. */
+static void chuck_global_step(float loss_val) {
+    const float eps = 1e-8f;
+    chuck_state *cs = &cstate;
+    if (!cs->initialized) {
+        cs->dampen = 1.0f; cs->noise = 0.0f; cs->lr_scale = 1.0f;
+        cs->best_macro = 1e9f; cs->initialized = 1;
+    }
+    if (cs->loss_ema == 0.0f) cs->loss_ema = loss_val;
+    else cs->loss_ema = 0.99f * cs->loss_ema + 0.01f * loss_val;
+    cs->loss_hist[cs->pos] = cs->loss_ema;
+    cs->pos = (cs->pos + 1) % NT_CHUCK_WINDOW;
+    if (cs->pos == 0) cs->full = 1;
+
+    int len = cs->full ? NT_CHUCK_WINDOW : cs->pos;
+    if (len >= 8) {
+        int q = len / 4; if (q < 1) q = 1;
+        int old_start = cs->full ? ((cs->pos) % NT_CHUCK_WINDOW) : 0;
+        int recent_start = cs->full ? ((cs->pos - q + NT_CHUCK_WINDOW) % NT_CHUCK_WINDOW) : (cs->pos - q);
+        float old_avg = chuck_ring_avg(cs->loss_hist, cs->pos, cs->full, old_start, q);
+        float recent_avg = chuck_ring_avg(cs->loss_hist, cs->pos, cs->full, recent_start, q);
+        if (old_avg > eps) {
+            float trend = (recent_avg - old_avg) / old_avg;
+            if (trend > NT_CHUCK_TREND_BRAKE) cs->dampen *= NT_CHUCK_DAMP_DOWN;
+            if (trend < NT_CHUCK_TREND_PUSH)  cs->dampen *= NT_CHUCK_DAMP_UP;
+            if (fabsf(trend) < NT_CHUCK_STAG_THRESH) {
+                cs->stag++;
+                if (cs->stag >= NT_CHUCK_STAG_STEPS) { cs->noise = NT_CHUCK_NOISE_MAG; cs->stag = 0; }
+            } else {
+                cs->stag = 0;
+                cs->noise *= NT_CHUCK_NOISE_DECAY;
+            }
+        }
+    }
+    cs->dampen = NT_CHUCK_MEAN_REVERT * cs->dampen + (1.0f - NT_CHUCK_MEAN_REVERT) * 1.0f;
+    if (cs->dampen < NT_CHUCK_DAMP_LO) cs->dampen = NT_CHUCK_DAMP_LO;
+    if (cs->dampen > NT_CHUCK_DAMP_HI) cs->dampen = NT_CHUCK_DAMP_HI;
+
+    cs->global_step++;
+    if (cs->macro_ema == 0.0f) cs->macro_ema = loss_val;
+    else cs->macro_ema = 0.999f * cs->macro_ema + 0.001f * loss_val;
+    if (cs->global_step % NT_CHUCK_MACRO_INT == 0 && cs->global_step > NT_CHUCK_WINDOW) {
+        if (cs->macro_ema > cs->best_macro * 0.999f) {
+            cs->macro_stag++;
+            if (cs->macro_stag >= NT_CHUCK_MACRO_PAT) {
+                cs->lr_scale *= NT_CHUCK_MACRO_DECAY;
+                if (cs->lr_scale < 0.05f) cs->lr_scale = 0.05f;
+                cs->macro_stag = 0;
+            }
+        } else {
+            cs->best_macro = cs->macro_ema;
+            cs->macro_stag = 0;
+            if (cs->lr_scale < 1.0f) { cs->lr_scale *= 1.2f; if (cs->lr_scale > 1.0f) cs->lr_scale = 1.0f; }
+        }
     }
 }
 
-static void update(void) {
-    adam_t++;
-    adam_apply((float*)E,  (float*)gE,  (float*)mE,  (float*)vE,  VMAX * D);
-    adam_apply((float*)Wq, (float*)gWq, (float*)mWq, (float*)vWqs, D * D);
-    adam_apply((float*)Wk, (float*)gWk, (float*)mWk, (float*)vWks, D * D);
-    adam_apply((float*)Wv, (float*)gWv, (float*)mWv, (float*)vWvs, D * D);
-    adam_apply((float*)Wo, (float*)gWo, (float*)mWo, (float*)vWos, D * D);
-    adam_apply((float*)Wu, (float*)gWu, (float*)mWu, (float*)vWu,  D * VMAX);
+/* Level 2: per-tensor grad-norm dampen + freeze + Adam-core update. */
+static void chuck_step(float *w, float *g, float *m, float *v, chuck_param *cp, int n) {
+    const float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
+    chuck_state *cs = &cstate;
+    if (cp->dampen == 0.0f) cp->dampen = 1.0f;
+    if (cp->frozen) return;
+
+    float gnorm = 0.0f;
+    for (int j = 0; j < n; j++) gnorm += g[j] * g[j];
+    gnorm = sqrtf(gnorm);
+
+    cp->grad_hist[cp->pos] = gnorm;
+    cp->pos = (cp->pos + 1) % NT_CHUCK_WINDOW;
+    if (cp->pos == 0) cp->full = 1;
+
+    int plen = cp->full ? NT_CHUCK_WINDOW : cp->pos;
+    if (plen >= 8) {
+        int q = plen / 4; if (q < 1) q = 1;
+        int old_start = cp->full ? ((cp->pos) % NT_CHUCK_WINDOW) : 0;
+        int recent_start = cp->full ? ((cp->pos - q + NT_CHUCK_WINDOW) % NT_CHUCK_WINDOW) : (cp->pos - q);
+        float old_gn = chuck_ring_avg(cp->grad_hist, cp->pos, cp->full, old_start, q);
+        float recent_gn = chuck_ring_avg(cp->grad_hist, cp->pos, cp->full, recent_start, q);
+        if (old_gn > eps) {
+            float gtrend = (recent_gn - old_gn) / old_gn;
+            if (gtrend > 0.05f)  cp->dampen *= NT_CHUCK_DAMP_UP;
+            if (gtrend < -0.05f) cp->dampen *= NT_CHUCK_DAMP_DOWN;
+        }
+        if (gnorm < NT_CHUCK_FREEZE_THRESH) {
+            cp->stag++;
+            if (!chuck_lite && cp->stag >= NT_CHUCK_STAG_STEPS) cp->frozen = 1;
+        } else {
+            cp->stag = 0;
+        }
+        cp->dampen = NT_CHUCK_MEAN_REVERT * cp->dampen + (1.0f - NT_CHUCK_MEAN_REVERT) * 1.0f;
+        if (cp->dampen < NT_CHUCK_DAMP_LO) cp->dampen = NT_CHUCK_DAMP_LO;
+        if (cp->dampen > NT_CHUCK_DAMP_HI) cp->dampen = NT_CHUCK_DAMP_HI;
+    }
+
+    float effective_lr = LR * cs->dampen * cp->dampen * cs->lr_scale;
+    cp->t++;
+    float bc1 = 1.0f - powf(beta1, (float)cp->t);
+    float bc2 = 1.0f - powf(beta2, (float)cp->t);
+    for (int j = 0; j < n; j++) {
+        float gg = g[j];
+        m[j] = beta1 * m[j] + (1.0f - beta1) * gg;
+        v[j] = beta2 * v[j] + (1.0f - beta2) * gg * gg;
+        float m_hat = m[j] / bc1;
+        float v_hat = v[j] / bc2;
+        float upd = effective_lr * m_hat / (sqrtf(v_hat) + eps);
+        if (!chuck_lite && cs->noise > 0.0f) upd += cs->noise * chuck_randn();
+        w[j] -= upd;
+    }
+}
+
+static void update(float loss) {
+    chuck_global_step(loss);
+    chuck_step((float*)E,  (float*)gE,  (float*)mE,  (float*)vE,  &cp_E,  VMAX * D);
+    chuck_step((float*)Wq, (float*)gWq, (float*)mWq, (float*)vWqs, &cp_Wq, D * D);
+    chuck_step((float*)Wk, (float*)gWk, (float*)mWk, (float*)vWks, &cp_Wk, D * D);
+    chuck_step((float*)Wv, (float*)gWv, (float*)mWv, (float*)vWvs, &cp_Wv, D * D);
+    chuck_step((float*)Wo, (float*)gWo, (float*)mWo, (float*)vWos, &cp_Wo, D * D);
+    chuck_step((float*)Wu, (float*)gWu, (float*)mWu, (float*)vWu,  &cp_Wu, D * VMAX);
 }
 
 /* ============================================================ */
@@ -672,7 +838,7 @@ static float train_loop(int *data, int dn, int steps, int seq_per_step, int prin
             memcpy(seq, data + start, CTX * sizeof(int));
             float loss = forward(seq, CTX, 1);
             backward();
-            update();
+            update(loss);
 
             int last = seq[CTX - 1];
             int next = data[start + CTX];
@@ -922,6 +1088,11 @@ static int run_test(void) {
     int n_active = 0; float tr_mass = 0;
     for (int v = 0; v < V; v++) { if (tr[v] > 0.01f) n_active++; tr_mass += tr[v]; }
     printf("per-life trace: active=%d / %d, mass=%.3f\n", n_active, V, tr_mass);
+
+    int n_frozen = cp_E.frozen + cp_Wq.frozen + cp_Wk.frozen + cp_Wv.frozen + cp_Wo.frozen + cp_Wu.frozen;
+    printf("chuck[%s]: dampen=%.3f lr_scale=%.3f noise=%.4f frozen=%d/6\n",
+           chuck_lite ? "lite" : "full", (double)cstate.dampen, (double)cstate.lr_scale,
+           (double)cstate.noise, n_frozen);
 
     printf("\n[causal-prefix invariance probe (P0 regression)]\n");
     int leak = 0;
