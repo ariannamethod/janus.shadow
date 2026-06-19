@@ -97,6 +97,7 @@ static float r_c[CTX][D];
 static float prob_c[CTX][VMAX];
 static float trpos_c[CTX][VMAX];
 static float gate_c;
+static float gate_pos[CTX];
 
 /* — Adam state — */
 static float mE[VMAX][D], vE[VMAX][D];
@@ -430,7 +431,7 @@ static float forward(int *tok, int T, int compute_loss) {
             }
     }
 
-    /* Mean attention output for life-memory and coherence. */
+    /* Mean attention output for life-memory (carried to next forward). */
     float h_bar[D] = {0};
     for (int i = 0; i < T; i++)
         for (int d = 0; d < D; d++) h_bar[d] += h_c[i][d] / T;
@@ -439,14 +440,42 @@ static float forward(int *tok, int T, int compute_loss) {
     memcpy(old_prev, prev_h, sizeof old_prev);
     memcpy(old_mem, mem, sizeof old_mem);
 
-    float hist_coh = LIFE_READY ? cos_d(h_bar, old_prev) : q_coherence;
-    coherence = LIFE_READY ? (0.72f * hist_coh + 0.28f * q_coherence) : q_coherence;
-    coherence = clampf2(coherence, -1.0f, 1.0f);
+    /* Per-position CAUSAL gate: the logit at position i may only depend on the
+     * prefix 0..i. Running prefix means of Q/K/h give a coherence over what has
+     * been read so far, closing the full-window future leak. At i=T-1 the prefix
+     * is the whole window, so the published scalar gate_c / coherence /
+     * q_coherence equal the previous full-window values (telemetry unchanged). */
+    float mg = mag_Wu();
+    float mag_gate = clampf2((mg - MAG_THR) / MAG_RANGE, 0, 1);
+    float qs[D] = {0}, ks[D] = {0}, hs[D] = {0};
+    float last_qcoh = q_coherence, last_coh = coherence;
+    for (int i = 0; i < T; i++) {
+        for (int d = 0; d < D; d++) { qs[d] += Q_c[i][d]; ks[d] += K_c[i][d]; hs[d] += h_c[i][d]; }
+        float inv_i = 1.0f / (i + 1);
+        float qbar_i[D], kbar_i[D], hbar_i[D];
+        for (int d = 0; d < D; d++) { qbar_i[d] = qs[d] * inv_i; kbar_i[d] = ks[d] * inv_i; hbar_i[d] = hs[d] * inv_i; }
+        float qcoh_i = cos_d(qbar_i, kbar_i);
+        float hist_i = LIFE_READY ? cos_d(hbar_i, old_prev) : qcoh_i;
+        float coh_i  = LIFE_READY ? (0.72f * hist_i + 0.28f * qcoh_i) : qcoh_i;
+        coh_i = clampf2(coh_i, -1.0f, 1.0f);
+        float coh_gate_i = 0.55f + 0.45f * (coh_i + 1.0f) * 0.5f;
+        float g = mag_gate * coh_gate_i;
+        if (TRAINED && g < GATE_FLOOR * coh_gate_i) g = GATE_FLOOR * coh_gate_i;
+        if (!TRAINED) g = 0.0f;
+        gate_pos[i] = g;
+        last_qcoh = qcoh_i; last_coh = coh_i;
+    }
+    for (int i = T; i < CTX; i++) gate_pos[i] = 0.0f;
+
+    /* Published telemetry reflects the last causal prefix (== old full-window). */
+    q_coherence = last_qcoh;
+    coherence   = last_coh;
+    gate_c      = gate_pos[T - 1];
 
     float novelty, drift;
     if (LIFE_READY) {
         novelty = 1.0f - cos_d(x_c[T-1], old_mem);
-        drift   = 1.0f - hist_coh;
+        drift   = 1.0f - cos_d(h_bar, old_prev);
     } else {
         novelty = 1.0f - q_coherence;
         drift   = 1.0f - q_coherence;
@@ -461,22 +490,16 @@ static float forward(int *tok, int T, int compute_loss) {
     }
     LIFE_READY = 1;
 
-    float mg = mag_Wu();
-    float mag_gate = clampf2((mg - MAG_THR) / MAG_RANGE, 0, 1);
-    float coh_gate = 0.55f + 0.45f * (coherence + 1.0f) * 0.5f;
-    gate_c = mag_gate * coh_gate;
-    if (TRAINED && gate_c < GATE_FLOOR * coh_gate) gate_c = GATE_FLOOR * coh_gate;
-    if (!TRAINED) gate_c = 0.0f;
-
     float loss = 0.0f;
     int count = 0;
     for (int i = 0; i < T; i++) {
+        float gi = gate_pos[i];
         for (int v = 0; v < V; v++) {
             float neural = 0;
-            if (gate_c > 0) for (int d = 0; d < D; d++) neural += r_c[i][d] * Wu[d][v];
+            if (gi > 0) for (int d = 0; d < D; d++) neural += r_c[i][d] * Wu[d][v];
             float bg = logf((bi_count[tok[i]][v] + 0.08f) / (bi_row_sum[tok[i]] + 0.08f * V));
             float tg = (i >= 1) ? logf(1.0f + tri_get(tok[i-1], tok[i], v)) : 0.0f;
-            prob_c[i][v] = gate_c * neural + BIGRAM_W * bg + TRIGRAM_W * tg - TR_PENALTY * trpos_c[i][v];
+            prob_c[i][v] = gi * neural + BIGRAM_W * bg + TRIGRAM_W * tg - TR_PENALTY * trpos_c[i][v];
         }
 
         float mx = prob_c[i][0];
@@ -520,16 +543,20 @@ static void backward(void) {
         dlog[i][tok_cache[i+1]] -= inv;
     }
 
-    if (gate_c > 0) {
-        for (int i = 0; i < T - 1; i++) {
-            for (int d = 0; d < D; d++) {
-                float s = 0;
-                for (int v = 0; v < V; v++) {
-                    s += dlog[i][v] * Wu[d][v];
-                    gWu[d][v] += gate_c * r_c[i][d] * dlog[i][v];
-                }
-                gr[i][d] = gate_c * s;
+    /* gate_pos[i] is treated as a detached constant here: the gradient is NOT
+     * propagated through the gate's dependence on mag(Wu) / prefix Q/K/h. This
+     * is the same approximation the pre-fix scalar gate used; an exact gate
+     * gradient is a Phase 5 experiment (cf. the detached shadow recurrence). */
+    for (int i = 0; i < T - 1; i++) {
+        float gi = gate_pos[i];
+        if (gi <= 0) continue;
+        for (int d = 0; d < D; d++) {
+            float s = 0;
+            for (int v = 0; v < V; v++) {
+                s += dlog[i][v] * Wu[d][v];
+                gWu[d][v] += gi * r_c[i][d] * dlog[i][v];
             }
+            gr[i][d] = gi * s;
         }
     }
 
@@ -805,6 +832,51 @@ static const char *manifest =
 "characters. Memory is short, coherence is alive. ";
 
 /* ============================================================ */
+/*  Causal-prefix invariance probe (P0 regression)              */
+/* ============================================================ */
+
+/* A and B share tokens 0..p and differ only after p. The probability at
+ * position p must be identical within tolerance: logit p may not depend on
+ * tokens p+1..T-1. On the baseline this FAILS in trained mode, because the
+ * scalar gate_c is computed from full-window q_bar/k_bar (future-leaking),
+ * and PASSES in weightless mode, where gate_c is forced to 0. */
+static int causal_prefix_test(int trained_mode) {
+    const int T = 12, p = 5;
+    int A[12] = {3,7,1,4,9,2,  5,8,3,6,1,4};
+    int B[12] = {3,7,1,4,9,2,  7,2,9,1,8,3};
+
+    float s_tr[VMAX], s_mem[D], s_prev[D], s_coh, s_qcoh;
+    int   s_ready;
+    memcpy(s_tr, tr, sizeof tr);
+    memcpy(s_mem, mem, sizeof mem);
+    memcpy(s_prev, prev_h, sizeof prev_h);
+    s_coh = coherence; s_qcoh = q_coherence; s_ready = LIFE_READY;
+
+    TRAINED = trained_mode;
+    forward(A, T, 0);
+    float probA[VMAX];
+    for (int v = 0; v < V; v++) probA[v] = prob_c[p][v];
+
+    memcpy(tr, s_tr, sizeof tr);
+    memcpy(mem, s_mem, sizeof mem);
+    memcpy(prev_h, s_prev, sizeof prev_h);
+    coherence = s_coh; q_coherence = s_qcoh; LIFE_READY = s_ready;
+
+    forward(B, T, 0);
+    float md = 0.0f, l1 = 0.0f;
+    for (int v = 0; v < V; v++) {
+        float d = fabsf(probA[v] - prob_c[p][v]);
+        if (d > md) md = d;
+        l1 += d;
+    }
+    int pass = (md <= 1e-7f);
+    printf("  causal-prefix [%-10s] p=%d: max_abs=%.3e L1=%.3e -> %s\n",
+           trained_mode ? "trained" : "weightless", p, (double)md, (double)l1,
+           pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
+/* ============================================================ */
 /*  --test                                                       */
 /* ============================================================ */
 
@@ -851,7 +923,13 @@ static int run_test(void) {
     for (int v = 0; v < V; v++) { if (tr[v] > 0.01f) n_active++; tr_mass += tr[v]; }
     printf("per-life trace: active=%d / %d, mass=%.3f\n", n_active, V, tr_mass);
 
-    return rt_ok ? 0 : 1;
+    printf("\n[causal-prefix invariance probe (P0 regression)]\n");
+    int leak = 0;
+    leak |= causal_prefix_test(0); /* weightless: must PASS */
+    leak |= causal_prefix_test(1); /* trained:    must PASS after the causal fix */
+    printf("  => %s\n", leak ? "LEAK PRESENT (P0 regression!)" : "no leak");
+
+    return (rt_ok && !leak) ? 0 : 1;
 }
 
 /* ============================================================ */

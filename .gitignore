@@ -1,0 +1,11 @@
+# local work journal — internal, not for the public repo
+PROJECT_LOG.md
+# build artifacts
+janus-shadow
+janus-shadow-*
+*.o
+a.out
+# model checkpoints
+*.janus
+*.jshadow
+*.lukas
