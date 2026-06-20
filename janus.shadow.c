@@ -35,12 +35,24 @@
 #define Q_AVX2 1
 #endif
 
-/* — architecture — */
+/* — architecture — (compile-time configurable: the scaled training binary is
+ *  built with -DD=512 -DVMAX=4096 -DCTX=128 -DMAXTOK=5000000 -DHSZ=4194304;
+ *  the bare defaults stay the fast self-test prototype.) */
+#ifndef VMAX
 #define VMAX     512
+#endif
+#ifndef D
 #define D        48
+#endif
+#ifndef CTX
 #define CTX      48
+#endif
+#ifndef MAXTOK
 #define MAXTOK   65536
+#endif
+#ifndef HSZ
 #define HSZ      131072
+#endif
 
 /* — shadow & training — */
 #ifndef ALPHA
@@ -64,7 +76,9 @@
 #define NEED_NOV      0.30f
 #define NEED_DRF      0.20f
 #define NEED_COH      0.30f
-#define SCALE_INV     0.144338f /* 1/sqrt(48) */
+/* SCALE_INV = 1/sqrt(D); set once in model_init for the active (compile-time) D.
+ * The old hardcoded 0.144338f was 1/sqrt(48) — wrong for any other D. */
+static float SCALE_INV = 0.144338f;
 
 /* — BPE — */
 static int L[VMAX], R[VMAX];
@@ -90,7 +104,7 @@ static int   LIFE_READY = 0;
 /* — corpus statistics — */
 static int      bi_count[VMAX][VMAX];
 static int      bi_row_sum[VMAX];
-static unsigned tri_key[HSZ];
+static uint64_t tri_key[HSZ];
 static int      tri_cnt[HSZ];
 
 /* — activations cached for backprop — */
@@ -296,13 +310,16 @@ static void stats_reset(void) {
     memset(tri_cnt, 0, sizeof tri_cnt);
 }
 
-static unsigned tri_pack(int a, int b, int c) {
-    return (((unsigned)a << 18) | ((unsigned)b << 9) | (unsigned)c) + 1u;
+/* 13 bits per token id (supports VMAX up to 8192) packed into a 64-bit key, so
+ * trigram traces stay collision-free at the scaled vocab. +1 keeps 0 as the
+ * empty-slot sentinel. */
+static uint64_t tri_pack(int a, int b, int c) {
+    return (((uint64_t)a << 26) | ((uint64_t)b << 13) | (uint64_t)c) + 1u;
 }
 
 static void tri_add(int a, int b, int c) {
-    unsigned k = tri_pack(a, b, c);
-    unsigned h = (k * 2654435761u) & (HSZ - 1);
+    uint64_t k = tri_pack(a, b, c);
+    unsigned h = (unsigned)(k * 2654435761ull) & (HSZ - 1);
     unsigned start = h;
     while (tri_key[h] && tri_key[h] != k) {
         h = (h + 1) & (HSZ - 1);
@@ -313,8 +330,8 @@ static void tri_add(int a, int b, int c) {
 }
 
 static int tri_get(int a, int b, int c) {
-    unsigned k = tri_pack(a, b, c);
-    unsigned h = (k * 2654435761u) & (HSZ - 1);
+    uint64_t k = tri_pack(a, b, c);
+    unsigned h = (unsigned)(k * 2654435761ull) & (HSZ - 1);
     unsigned start = h;
     while (tri_key[h] && tri_key[h] != k) {
         h = (h + 1) & (HSZ - 1);
@@ -335,6 +352,7 @@ static void stats_build(int *seq, int n) {
 
 static void model_init(void) {
     RNG = g_init_seed;
+    SCALE_INV = 1.0f / sqrtf((float)D);
     for (int v = 0; v < VMAX; v++)
         for (int d = 0; d < D; d++) E[v][d] = rr();
 
@@ -940,7 +958,7 @@ static int pick_topk(float *prob, int *recent_ctx, int rn) {
 }
 
 static void generate(const char *prompt, int n_out, FILE *out_f) {
-    int buf[MAXTOK];
+    static int buf[MAXTOK];   /* static: at scaled MAXTOK this is too big for the stack */
     int pn = bpe_encode((const unsigned char*)prompt, (int)strlen(prompt), buf);
     if (pn == 0) { buf[0] = ' '; pn = 1; }
 
@@ -1027,6 +1045,7 @@ static int load_model(const char *path) {
     fclose(f);
 
     rebuild_tok_str();
+    SCALE_INV = 1.0f / sqrtf((float)D);   /* a loaded model must use the correct 1/sqrt(D) attention scale */
     TRAINED = 1;
     LIFE_READY = 0;
     coherence = 1.0f;
@@ -1146,11 +1165,11 @@ static int causal_prefix_test(int trained_mode) {
 static int run_test(void) {
     srand(42);
     bpe_init();
-    int data[MAXTOK];
+    static int data[MAXTOK];   /* static: scaled MAXTOK overflows the stack */
     int n = bpe_train((const unsigned char*)manifest, (int)strlen(manifest), data, 96);
     printf("BPE vocab=%d corpus_tokens=%d\n", V, n);
 
-    int test_ids[MAXTOK];
+    static int test_ids[MAXTOK];
     int tn = bpe_encode((const unsigned char*)manifest, (int)strlen(manifest), test_ids);
     char buf[8192]; int p = 0;
     for (int i = 0; i < tn; i++) p = emit_tok_buf(test_ids[i], buf, p);
@@ -1470,7 +1489,7 @@ int main(int argc, char **argv) {
         if (!txt) { fprintf(stderr, "malloc failed\n"); fclose(f); return 1; }
         sz = (long)fread(txt, 1, (size_t)sz, f); txt[sz] = 0; fclose(f);
 
-        int data[MAXTOK];
+        static int data[MAXTOK];   /* static: scaled MAXTOK overflows the stack */
         int n = bpe_train((const unsigned char*)txt, (int)sz, data, 96);
         printf("BPE vocab=%d corpus_tokens=%d\n", V, n);
         model_init();
@@ -1508,7 +1527,7 @@ int main(int argc, char **argv) {
         if (!txt) { fprintf(stderr, "malloc failed\n"); fclose(f); return 1; }
         sz = (long)fread(txt, 1, (size_t)sz, f); txt[sz] = 0; fclose(f);
 
-        int data[MAXTOK];
+        static int data[MAXTOK];   /* static: scaled MAXTOK overflows the stack */
         int n = bpe_train((const unsigned char*)txt, (int)sz, data, 96);
         printf("BPE vocab=%d corpus_tokens=%d\n", V, n);
         model_init();
