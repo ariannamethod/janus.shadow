@@ -8,4 +8,4 @@ a.out
 # model checkpoints
 *.janus
 *.jshadow
-*.lukas
+*.janus

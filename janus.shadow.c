@@ -1,7 +1,7 @@
 /* janus.shadow.c — Shadow Attention Post-Transformer (patched super-version)
  * θ = ε + γ + αδ | attention knows what it needs
  *
- * Patches over lukas.c:
+ * Patches over the original shadow prototype:
  *   - honest weightless mode: no learned random weights influence Q/K/V or logits
  *   - transformer path preserved: structural Q/K/V still drive causal attention in noweights
  *   - Q-style cold-start coherence: coherence is meaningful on the first forward
@@ -10,12 +10,12 @@
  *   - bounded trigram hash probing: no infinite loop when table fills
  *   - softer neural gate with tiny training floor: Wu can learn without random dominance
  *
- * Compile: gcc lukas3_shadow_attention.c -O2 -lm -o lukas3
+ * Compile: make   (or: cc janus.shadow.c -lm -o janus-shadow)
  * Usage:
- *   ./lukas3 --test
- *   ./lukas3 train  corpus.txt model.lukas [epochs]
- *   ./lukas3 infer  model.lukas 'prompt' [tokens]
- *   ./lukas3 --noweights corpus.txt 'prompt'
+ *   ./janus-shadow --test
+ *   ./janus-shadow train  corpus.txt model.janus [epochs]
+ *   ./janus-shadow infer  model.janus 'prompt' [tokens]
+ *   ./janus-shadow --noweights corpus.txt 'prompt'
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -949,7 +949,7 @@ static void generate(const char *prompt, int n_out, FILE *out_f) {
 static int save_model(const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
-    fwrite("LUKAS3", 1, 6, f);
+    fwrite("JSHD01", 1, 6, f);
     fwrite(&V, sizeof V, 1, f);
     fwrite(L, sizeof L[0], VMAX, f);
     fwrite(R, sizeof R[0], VMAX, f);
@@ -990,7 +990,7 @@ static int load_model(const char *path) {
     if (!f) return 0;
     char m[7] = {0};
     fread(m, 1, 6, f);
-    if (strncmp(m, "LUKAS3", 6) != 0) { fclose(f); return 0; }
+    if (strncmp(m, "JSHD01", 6) != 0) { fclose(f); return 0; }
     fread(&V, sizeof V, 1, f);
     fread(L, sizeof L[0], VMAX, f);
     fread(R, sizeof R[0], VMAX, f);
@@ -1040,7 +1040,7 @@ static const char *manifest =
 "Attention asks itself: do I rely on what I have learned, or on what the "
 "corpus knows, or on what I have already attended to. The answer is a "
 "weighted sum, computed every step from observation, not stipulated. "
-"The shadow knows what attention needs. Lukas walks through tokens, not "
+"The shadow knows what attention needs. Janus walks through tokens, not "
 "characters. Memory is short, coherence is alive. ";
 
 /* ============================================================ */
@@ -1347,8 +1347,8 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
             "usage: %s --test\n"
-            "       %s train  corpus.txt model.lukas [epochs]\n"
-            "       %s infer  model.lukas 'prompt' [tokens]\n"
+            "       %s train  corpus.txt model.janus [epochs]\n"
+            "       %s infer  model.janus 'prompt' [tokens]\n"
             "       %s --noweights corpus.txt 'prompt'\n",
             argv[0], argv[0], argv[0], argv[0]);
     return 1;
