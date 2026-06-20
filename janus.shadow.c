@@ -25,6 +25,16 @@
 #include <limits.h>
 #include <stdint.h>
 
+/* — vendored SIMD: hand-vectorised matvec, notorch-lineage (NEON like
+ * arianna2arianna.c, AVX2 like notorch_simd.h). JS_SCALAR_ONLY forces scalar. */
+#if !defined(JS_SCALAR_ONLY) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#include <arm_neon.h>
+#define Q_NEON 1
+#elif !defined(JS_SCALAR_ONLY) && defined(__AVX2__)
+#include <immintrin.h>
+#define Q_AVX2 1
+#endif
+
 /* — architecture — */
 #define VMAX     512
 #define D        48
@@ -359,6 +369,38 @@ static float mag_Wu(void) {
     return s / (n ? n : 1);
 }
 
+/* Vendored hand-vectorised matvec (the "punk BLAS in C"): row-vector times
+ * matrix, out[j] = sum_i x[i] * W[i*stride + j] for j in [0,J). The i-summation
+ * order is identical to the scalar path, so SIMD differs only by fma rounding.
+ * NEON mirrors arianna2arianna.c; AVX2 mirrors notorch_simd.h. */
+static void vecmat(float *out, const float *x, const float *W, int I, int J, int stride) {
+    for (int j = 0; j < J; j++) out[j] = 0.0f;
+#if defined(Q_NEON)
+    for (int i = 0; i < I; i++) {
+        float32x4_t xb = vdupq_n_f32(x[i]);
+        const float *row = W + (long)i * stride;
+        int j = 0;
+        for (; j + 4 <= J; j += 4)
+            vst1q_f32(out + j, vfmaq_f32(vld1q_f32(out + j), xb, vld1q_f32(row + j)));
+        for (; j < J; j++) out[j] += x[i] * row[j];
+    }
+#elif defined(Q_AVX2)
+    for (int i = 0; i < I; i++) {
+        __m256 xb = _mm256_set1_ps(x[i]);
+        const float *row = W + (long)i * stride;
+        int j = 0;
+        for (; j + 8 <= J; j += 8)
+            _mm256_storeu_ps(out + j, _mm256_fmadd_ps(xb, _mm256_loadu_ps(row + j), _mm256_loadu_ps(out + j)));
+        for (; j < J; j++) out[j] += x[i] * row[j];
+    }
+#else
+    for (int i = 0; i < I; i++) {
+        const float *row = W + (long)i * stride;
+        for (int j = 0; j < J; j++) out[j] += x[i] * row[j];
+    }
+#endif
+}
+
 /* ============================================================ */
 /*  Forward                                                      */
 /* ============================================================ */
@@ -383,16 +425,11 @@ static float forward(int *tok, int T, int compute_loss) {
             for (int d = 0; d < D; d++)
                 structural_qkv(tok[i], d, &Q_c[i][d], &K_c[i][d], &V_c[i][d]);
     } else {
-        for (int i = 0; i < T; i++)
-            for (int d = 0; d < D; d++) {
-                float q = 0, k = 0, v = 0;
-                for (int e = 0; e < D; e++) {
-                    q += x_c[i][e] * Wq[e][d];
-                    k += x_c[i][e] * Wk[e][d];
-                    v += x_c[i][e] * Wv[e][d];
-                }
-                Q_c[i][d] = q; K_c[i][d] = k; V_c[i][d] = v;
-            }
+        for (int i = 0; i < T; i++) {
+            vecmat(Q_c[i], x_c[i], (const float*)Wq, D, D, D);
+            vecmat(K_c[i], x_c[i], (const float*)Wk, D, D, D);
+            vecmat(V_c[i], x_c[i], (const float*)Wv, D, D, D);
+        }
     }
 
     /* Q-style coherence exists from the first forward. */
@@ -466,13 +503,10 @@ static float forward(int *tok, int T, int compute_loss) {
                 r_c[i][d] = x_c[i][d] + h_c[i][d];
             }
     } else {
-        for (int i = 0; i < T; i++)
-            for (int d = 0; d < D; d++) {
-                float o = 0;
-                for (int e = 0; e < D; e++) o += h_c[i][e] * Wo[e][d];
-                op_c[i][d] = o;
-                r_c[i][d] = x_c[i][d] + o;
-            }
+        for (int i = 0; i < T; i++) {
+            vecmat(op_c[i], h_c[i], (const float*)Wo, D, D, D);
+            for (int d = 0; d < D; d++) r_c[i][d] = x_c[i][d] + op_c[i][d];
+        }
     }
 
     /* Mean attention output for life-memory (carried to next forward). */
@@ -536,14 +570,15 @@ static float forward(int *tok, int T, int compute_loss) {
 
     float loss = 0.0f;
     int count = 0;
+    float neural[VMAX];
     for (int i = 0; i < T; i++) {
         float gi = gate_pos[i];
+        if (gi > 0.0f) vecmat(neural, r_c[i], (const float*)Wu, D, V, VMAX);
         for (int v = 0; v < V; v++) {
-            float neural = 0;
-            if (gi > 0) for (int d = 0; d < D; d++) neural += r_c[i][d] * Wu[d][v];
+            float nv = (gi > 0.0f) ? neural[v] : 0.0f;
             float bg = logf((bi_count[tok[i]][v] + 0.08f) / (bi_row_sum[tok[i]] + 0.08f * V));
             float tg = (i >= 1) ? logf(1.0f + tri_get(tok[i-1], tok[i], v)) : 0.0f;
-            prob_c[i][v] = gi * neural + BIGRAM_W * bg + TRIGRAM_W * tg - TR_PENALTY * trpos_c[i][v];
+            prob_c[i][v] = gi * nv + BIGRAM_W * bg + TRIGRAM_W * tg - TR_PENALTY * trpos_c[i][v];
         }
 
         float mx = prob_c[i][0];
@@ -998,6 +1033,38 @@ static const char *manifest =
 "characters. Memory is short, coherence is alive. ";
 
 /* ============================================================ */
+/*  vecmat SIMD selftest                                         */
+/* ============================================================ */
+
+/* Confirms the vendored SIMD matvec matches a plain scalar reference within
+ * fma-rounding tolerance. J<stride exercises the Wu (stride=VMAX) case. */
+static int vecmat_selftest(void) {
+    enum { TI = 7, TJ = 13, TS = 16 };
+    float W[TI * TS], x[TI], out[TS], ref[TS];
+    unsigned s = 0x1234567u;
+    for (int i = 0; i < TI; i++)      { s = s * 1664525u + 1013904223u; x[i] = ((s >> 9) & 0xFFFF) / 32768.0f - 1.0f; }
+    for (int i = 0; i < TI * TS; i++) { s = s * 1664525u + 1013904223u; W[i] = ((s >> 9) & 0xFFFF) / 32768.0f - 1.0f; }
+    vecmat(out, x, W, TI, TJ, TS);
+    for (int j = 0; j < TJ; j++) { float a = 0; for (int i = 0; i < TI; i++) a += x[i] * W[i * TS + j]; ref[j] = a; }
+    float maxrel = 0.0f;
+    for (int j = 0; j < TJ; j++) {
+        float rel = fabsf(out[j] - ref[j]) / (fabsf(ref[j]) + 1e-9f);
+        if (rel > maxrel) maxrel = rel;
+    }
+    const char *path =
+#if defined(Q_NEON)
+        "NEON";
+#elif defined(Q_AVX2)
+        "AVX2";
+#else
+        "scalar";
+#endif
+    int ok = (maxrel < 1e-5f);
+    printf("vecmat selftest [%s]: max_rel=%.3e -> %s\n", path, (double)maxrel, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* ============================================================ */
 /*  Causal-prefix invariance probe (P0 regression)              */
 /* ============================================================ */
 
@@ -1094,13 +1161,16 @@ static int run_test(void) {
            chuck_lite ? "lite" : "full", (double)cstate.dampen, (double)cstate.lr_scale,
            (double)cstate.noise, n_frozen);
 
+    printf("\n[vecmat SIMD selftest]\n  ");
+    int vm = vecmat_selftest();
+
     printf("\n[causal-prefix invariance probe (P0 regression)]\n");
     int leak = 0;
     leak |= causal_prefix_test(0); /* weightless: must PASS */
     leak |= causal_prefix_test(1); /* trained:    must PASS after the causal fix */
     printf("  => %s\n", leak ? "LEAK PRESENT (P0 regression!)" : "no leak");
 
-    return (rt_ok && !leak) ? 0 : 1;
+    return (rt_ok && !leak && !vm) ? 0 : 1;
 }
 
 /* ============================================================ */
