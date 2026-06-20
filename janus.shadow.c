@@ -54,6 +54,23 @@
 #define HSZ      131072
 #endif
 
+/* — training defaults (compile-time configurable) — */
+#ifndef MERGES_TRAIN
+#define MERGES_TRAIN  (VMAX - 256)   /* BPE merges for real corpora; small corpora self-limit */
+#endif
+#ifndef TRAIN_STEPS
+#define TRAIN_STEPS   15000
+#endif
+#ifndef TRAIN_SEQ
+#define TRAIN_SEQ     4
+#endif
+#ifndef CKPT_INTERVAL
+#define CKPT_INTERVAL 1000
+#endif
+#ifndef VAL_CAP
+#define VAL_CAP       8192   /* cap held-out tokens scored per val report (bounds val cost) */
+#endif
+
 /* — shadow & training — */
 #ifndef ALPHA
 #define ALPHA       0.5f   /* -DALPHA=0.0f for the exact (shadow-free) gradcheck */
@@ -1373,7 +1390,7 @@ static int run_eval(const char *text, int textlen, int nseeds) {
      * the learned merges only (val never adds a merge or a corpus statistic). */
     bpe_init();
     static int train_data[MAXTOK];
-    int tn = bpe_train(bytes, split, train_data, 96);
+    int tn = bpe_train(bytes, split, train_data, MERGES_TRAIN);
     static int val_data[MAXTOK];
     int vn = bpe_encode(bytes + split, textlen - split, val_data);
     if (tn <= CTX + 1) { fprintf(stderr, "train split too short after BPE (%d tokens)\n", tn); return 1; }
@@ -1444,6 +1461,69 @@ static int run_eval(const char *text, int textlen, int nseeds) {
 }
 
 /* ============================================================ */
+/*  Production training run (checkpoints + held-out 4-mode val)  */
+/* ============================================================ */
+
+/* Held-out CE on four diagnostic modes so hybrid-masking (the always-on n-gram
+ * path hiding a non-learning neural path) is visible during training. eval_ce
+ * restores the training life-state; this restores the training logit mode. */
+static void train_val_report(int step, const int *val, int vn) {
+    struct { const char *n; int tr, ne, bg, tg, trc; float a; } M[] = {
+        {"full",     1, 1, 1, 1, 1, ALPHA},
+        {"ngram",    1, 0, 1, 1, 0, ALPHA},
+        {"neural",   1, 1, 0, 0, 0, ALPHA},
+        {"noshadow", 1, 1, 1, 1, 0, 0.0f},
+    };
+    int vc = (vn > VAL_CAP) ? VAL_CAP : vn;   /* bound val cost regardless of corpus size */
+    printf("  [val@%d]", step);
+    for (int m = 0; m < 4; m++) {
+        eval_set_mode(M[m].tr, M[m].ne, M[m].bg, M[m].tg, M[m].trc, M[m].a);
+        printf("  %s %.3f", M[m].n, eval_ce(val, vc));
+    }
+    printf("\n");
+    eval_set_mode(1, 1, 1, 1, 1, ALPHA);   /* back to training mode */
+}
+
+/* The real training loop: `steps` steps of `seq_per_step` sequences each,
+ * periodic checkpoint + held-out val report, abort on NaN/Inf. Corpus n-gram
+ * stats grow online from the train split only (val is never touched here). */
+static float train_run(int *data, int dn, const int *val, int vn,
+                       int steps, int seq_per_step, const char *ckpt_path, int ckpt_interval) {
+    TRAINED = 1;
+    if (dn <= CTX + 1) { fprintf(stderr, "train corpus too short: %d tokens\n", dn); return 0.0f; }
+    if (seq_per_step < 1) seq_per_step = 1;
+    memset(tr, 0, sizeof tr); memset(mem, 0, sizeof mem); memset(prev_h, 0, sizeof prev_h);
+    LIFE_READY = 0; coherence = 1.0f; q_coherence = 1.0f;
+
+    float last = 0.0f;
+    for (int step = 0; step < steps; step++) {
+        float bl = 0.0f;
+        for (int s = 0; s < seq_per_step; s++) {
+            int start = rand() % (dn - CTX);   /* full valid range: start in [0, dn-CTX-1] */
+            int seq[CTX];
+            memcpy(seq, data + start, CTX * sizeof(int));
+            float loss = forward(seq, CTX, 1);
+            backward();
+            update(loss);
+            int lastk = seq[CTX - 1], next = data[start + CTX];
+            bi_count[lastk][next]++; bi_row_sum[lastk]++;
+            if (CTX >= 2) tri_add(seq[CTX - 2], lastk, next);
+            bl += loss;
+        }
+        bl /= seq_per_step;
+        last = bl;
+        if (isnan(bl) || isinf(bl)) { printf("step %5d | loss %.4f -> ABORT (NaN/Inf)\n", step, bl); return bl; }
+        if (step % 100 == 0 || step == steps - 1)
+            printf("step %5d | loss %.4f | gate %.2f qcoh %.2f\n", step, bl, gate_c, q_coherence);
+        if (ckpt_interval > 0 && (step == steps - 1 || (step > 0 && step % ckpt_interval == 0))) {
+            if (ckpt_path && save_model(ckpt_path)) printf("  [ckpt %s @ %d]\n", ckpt_path, step);
+            if (val && vn > 1) train_val_report(step, val, vn);
+        }
+    }
+    return last;
+}
+
+/* ============================================================ */
 /*  main                                                         */
 /* ============================================================ */
 
@@ -1479,7 +1559,11 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(argv[1], "train") == 0 && argc >= 4) {
+        /* train corpus model [steps] [seq_per_step] — 90/10 split, BPE + n-gram
+         * stats on the train split only, periodic checkpoint + held-out 4-mode val. */
         srand(42);
+        int steps = (argc > 4 && is_uint_arg(argv[4])) ? atoi(argv[4]) : TRAIN_STEPS;
+        int seqp  = (argc > 5 && is_uint_arg(argv[5])) ? atoi(argv[5]) : TRAIN_SEQ;
         bpe_init();
         FILE *f = fopen(argv[2], "rb");
         if (!f) { perror(argv[2]); return 1; }
@@ -1489,19 +1573,18 @@ int main(int argc, char **argv) {
         if (!txt) { fprintf(stderr, "malloc failed\n"); fclose(f); return 1; }
         sz = (long)fread(txt, 1, (size_t)sz, f); txt[sz] = 0; fclose(f);
 
-        static int data[MAXTOK];   /* static: scaled MAXTOK overflows the stack */
-        int n = bpe_train((const unsigned char*)txt, (int)sz, data, 96);
-        printf("BPE vocab=%d corpus_tokens=%d\n", V, n);
+        int split = (int)((double)sz * 0.9);
+        if (split < 1 || split >= (int)sz) split = (int)sz;   /* tiny corpus -> no held-out val */
+        static int data[MAXTOK], vdata[MAXTOK];   /* static: scaled MAXTOK overflows the stack */
+        int n  = bpe_train((const unsigned char*)txt, split, data, MERGES_TRAIN);
+        int vn = (split < (int)sz) ? bpe_encode((const unsigned char*)txt + split, (int)sz - split, vdata) : 0;
+        printf("BPE vocab=%d train_tokens=%d val_tokens=%d | steps=%d seq=%d\n", V, n, vn, steps, seqp);
         model_init();
         stats_build(data, n);
-
-        int epochs = argc > 4 ? atoi(argv[4]) : 1;
-        int steps_per_epoch = 800;
-        for (int e = 0; e < epochs; e++) {
-            printf("\n[epoch %d]\n", e + 1);
-            train_loop(data, n, steps_per_epoch, 1, 100);
-        }
-        if (save_model(argv[3])) printf("\nsaved: %s\n", argv[3]);
+        float fl = train_run(data, n, vdata, vn, steps, seqp, argv[3], CKPT_INTERVAL);
+        if (isnan(fl) || isinf(fl))
+            fprintf(stderr, "training diverged (NaN/Inf) -- last good checkpoint kept, not overwriting\n");
+        else if (save_model(argv[3])) printf("saved: %s\n", argv[3]);
         else fprintf(stderr, "save failed: %s\n", argv[3]);
         free(txt);
         return 0;
@@ -1528,7 +1611,7 @@ int main(int argc, char **argv) {
         sz = (long)fread(txt, 1, (size_t)sz, f); txt[sz] = 0; fclose(f);
 
         static int data[MAXTOK];   /* static: scaled MAXTOK overflows the stack */
-        int n = bpe_train((const unsigned char*)txt, (int)sz, data, 96);
+        int n = bpe_train((const unsigned char*)txt, (int)sz, data, MERGES_TRAIN);
         printf("BPE vocab=%d corpus_tokens=%d\n", V, n);
         model_init();
         stats_build(data, n);
