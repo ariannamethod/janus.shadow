@@ -115,6 +115,22 @@ static float gc_gate_val[CTX];
 static float gc_trpos[CTX][VMAX];
 static int   gc_neural_only = 0;     /* gradcheck: loss on pure neural logits (priors off) */
 
+/* — honest-eval ablation knobs — runtime toggles whose DEFAULTS reproduce the
+ * composed logit + training behaviour byte-for-byte (each adds its original
+ * term, +0.0f is exact). The --eval harness flips them per ablation mode and
+ * restores them afterwards; train/infer/gradcheck never touch them.
+ *   em_*        : gate each additive logit term (neural / bigram / trigram / trace).
+ *   g_alpha     : micro-shadow contrast in attention; mirrors ALPHA (default-equal),
+ *                 set to 0 to ablate the per-forward shadow without recompiling.
+ *   g_init_seed : weight-init RNG seed; default == model_init's fixed seed, so
+ *                 --test/train stay deterministic. --eval varies it per seed. */
+static int      em_neural   = 1;
+static int      em_bigram   = 1;
+static int      em_trigram  = 1;
+static int      em_trace    = 1;
+static float    g_alpha     = ALPHA;
+static unsigned g_init_seed = 0x51AD05u;
+
 /* — Chuck optimizer: per-tensor m/v moment buffers — */
 static float mE[VMAX][D], vE[VMAX][D];
 static float mWq[D][D], vWqs[D][D];
@@ -318,7 +334,7 @@ static void stats_build(int *seq, int n) {
 /* ============================================================ */
 
 static void model_init(void) {
-    RNG = 0x51AD05u;
+    RNG = g_init_seed;
     for (int v = 0; v < VMAX; v++)
         for (int d = 0; d < D; d++) E[v][d] = rr();
 
@@ -466,7 +482,7 @@ static float forward(int *tok, int T, int compute_loss) {
         float sc[CTX];
         float mx = -1e9f;
         for (int k = 0; k <= q; k++) {
-            sc[k] = raw_c[q][k] + ALPHA * th_c[q][k];
+            sc[k] = raw_c[q][k] + g_alpha * th_c[q][k];
             if (sc[k] > mx) mx = sc[k];
         }
         float z = 0;
@@ -589,7 +605,10 @@ static float forward(int *tok, int T, int compute_loss) {
             float tg = (i >= 1) ? logf(1.0f + tri_get(tok[i-1], tok[i], v)) : 0.0f;
             float trp = gc_freeze ? gc_trpos[i][v] : trpos_c[i][v];
             prob_c[i][v] = gc_neural_only ? (gi * nv)
-                         : (gi * nv + BIGRAM_W * bg + TRIGRAM_W * tg - TR_PENALTY * trp);
+                         : ( (em_neural  ? gi * nv          : 0.0f)
+                           + (em_bigram  ? BIGRAM_W  * bg   : 0.0f)
+                           + (em_trigram ? TRIGRAM_W * tg   : 0.0f)
+                           - (em_trace   ? TR_PENALTY * trp : 0.0f) );
         }
 
         float mx = prob_c[i][0];
@@ -683,7 +702,7 @@ static void backward(void) {
     static float draw[CTX][CTX];
     for (int q = 0; q < T - 1; q++)
         for (int k = 0; k <= q; k++)
-            draw[q][k] = gsc[q][k] * (1.0f + ALPHA * (1.0f - th_c[q][k] * th_c[q][k]));
+            draw[q][k] = gsc[q][k] * (1.0f + g_alpha * (1.0f - th_c[q][k] * th_c[q][k]));
 
     for (int q = 0; q < T - 1; q++)
         for (int k = 0; k <= q; k++)
@@ -1274,13 +1293,171 @@ static int gradcheck(void) {
 }
 
 /* ============================================================ */
+/*  Honest held-out evaluation (train/val split + ablation)      */
+/* ============================================================ */
+
+/* Cross-entropy of the current model+mode over held-out tokens. Runs on a
+ * FRESH life (trace/memory zeroed) and streams val in non-overlapping CTX
+ * windows: each token is read exactly once (trace stays honest) and position i
+ * predicts i+1 only from prefix 0..i (the causal fix forbids future leak). The
+ * persistent life-state is snapshotted and restored, so eval never mutates the
+ * trained weights or the corpus statistics. */
+static double eval_ce(const int *val, int nval) {
+    float s_tr[VMAX], s_mem[D], s_prev[D], s_coh, s_qcoh; int s_ready;
+    memcpy(s_tr, tr, sizeof tr); memcpy(s_mem, mem, sizeof mem); memcpy(s_prev, prev_h, sizeof prev_h);
+    s_coh = coherence; s_qcoh = q_coherence; s_ready = LIFE_READY;
+
+    memset(tr, 0, sizeof tr); memset(mem, 0, sizeof mem); memset(prev_h, 0, sizeof prev_h);
+    coherence = 1.0f; q_coherence = 1.0f; LIFE_READY = 0;
+
+    double nll = 0.0; long cnt = 0;
+    int wseq[CTX];
+    for (int start = 0; start + 1 < nval; start += CTX) {
+        int len = nval - start; if (len > CTX) len = CTX;
+        if (len < 2) break;
+        for (int i = 0; i < len; i++) wseq[i] = val[start + i];
+        forward(wseq, len, 1);
+        for (int i = 0; i < len - 1; i++) {
+            float p = prob_c[i][val[start + i + 1]];
+            if (p < 1e-9f) p = 1e-9f;
+            nll += -log((double)p);
+            cnt++;
+        }
+    }
+
+    memcpy(tr, s_tr, sizeof tr); memcpy(mem, s_mem, sizeof mem); memcpy(prev_h, s_prev, sizeof prev_h);
+    coherence = s_coh; q_coherence = s_qcoh; LIFE_READY = s_ready;
+    return cnt ? nll / (double)cnt : 0.0;
+}
+
+static void eval_set_mode(int trained, int neural, int bigram, int trigram, int trace, float alpha) {
+    TRAINED    = trained;
+    em_neural  = neural;
+    em_bigram  = bigram;
+    em_trigram = trigram;
+    em_trace   = trace;
+    g_alpha    = alpha;
+}
+
+/* Train models on a held-out split and report a CE/perplexity ablation matrix.
+ * The question it answers: does the trained neural + shadow path predict
+ * held-out tokens better than a pure n-gram predictor (full << n-gram-only)? */
+static int run_eval(const char *text, int textlen, int nseeds) {
+    if (nseeds < 1) nseeds = 1;
+    if (nseeds > 8) nseeds = 8;
+    if (textlen < 64) { fprintf(stderr, "corpus too short for eval (%d bytes)\n", textlen); return 1; }
+    int split = (int)((double)textlen * 0.8);
+    if (split < 32) split = textlen / 2;
+    const unsigned char *bytes = (const unsigned char *)text;
+
+    /* BPE is deterministic from the train bytes — train it once; encode val with
+     * the learned merges only (val never adds a merge or a corpus statistic). */
+    bpe_init();
+    static int train_data[MAXTOK];
+    int tn = bpe_train(bytes, split, train_data, 96);
+    static int val_data[MAXTOK];
+    int vn = bpe_encode(bytes + split, textlen - split, val_data);
+    if (tn <= CTX + 1) { fprintf(stderr, "train split too short after BPE (%d tokens)\n", tn); return 1; }
+    if (vn < 2)        { fprintf(stderr, "val split too short after BPE (%d tokens)\n", vn); return 1; }
+
+    struct { const char *name; int trained, neural, bigram, trigram, trace; float alpha; } modes[] = {
+        /* name                     tr ne bg tg trc  alpha */
+        {"full",                     1, 1, 1, 1, 1,  ALPHA},
+        {"n-gram-only",              1, 0, 1, 1, 0,  ALPHA},
+        {"neural-only",              1, 1, 0, 0, 0,  ALPHA},
+        {"weightless",               0, 1, 1, 1, 1,  ALPHA},
+        {"transformer-no-shadow",    1, 1, 1, 1, 0,  0.0f},
+        {"micro-shadow-only",        1, 1, 1, 1, 0,  ALPHA},
+        {"macro-trace-only",         1, 1, 1, 1, 1,  0.0f},
+    };
+    const int NM = (int)(sizeof modes / sizeof modes[0]);
+    const int EVAL_STEPS = 600;
+
+    static double ce[16][8];   /* [mode][seed] */
+    static double trf[8];      /* full-mode CE on the train split (overfit gap) */
+
+    printf("=== honest held-out eval (train/val 80/20, BPE + stats on train only) ===\n");
+    printf("corpus_bytes=%d  train_tokens=%d  val_tokens=%d  vocab=%d  seeds=%d  steps=%d\n",
+           textlen, tn, vn, V, nseeds, EVAL_STEPS);
+
+    for (int s = 0; s < nseeds; s++) {
+        g_init_seed = 0x51AD05u + (unsigned)s * 2654435761u;  /* vary weight init */
+        srand((unsigned)(1000 + s));                          /* vary training-window order */
+        stats_build(train_data, tn);   /* fresh train stats each seed (train_loop augments online) */
+        model_init();
+        eval_set_mode(1, 1, 1, 1, 1, ALPHA);
+        train_loop(train_data, tn, EVAL_STEPS, 1, 0);
+        trf[s] = eval_ce(train_data, tn);   /* full mode still set */
+        for (int m = 0; m < NM; m++) {
+            eval_set_mode(modes[m].trained, modes[m].neural, modes[m].bigram,
+                          modes[m].trigram, modes[m].trace, modes[m].alpha);
+            ce[m][s] = eval_ce(val_data, vn);
+        }
+    }
+    eval_set_mode(1, 1, 1, 1, 1, ALPHA);   /* restore defaults */
+    g_init_seed = 0x51AD05u;
+
+    printf("\n%-24s  %-19s  %-9s\n", "mode", "val_CE (mean+-std)", "val_PPL");
+    printf("-----------------------------------------------------------\n");
+    double full_mean = 0.0, ngram_mean = 0.0;
+    for (int m = 0; m < NM; m++) {
+        double mean = 0.0;
+        for (int s = 0; s < nseeds; s++) mean += ce[m][s];
+        mean /= nseeds;
+        double var = 0.0;
+        for (int s = 0; s < nseeds; s++) { double d = ce[m][s] - mean; var += d * d; }
+        double sd = sqrt(var / nseeds);
+        printf("%-24s  %6.3f +- %5.3f       %8.2f\n", modes[m].name, mean, sd, exp(mean));
+        if (strcmp(modes[m].name, "full") == 0)        full_mean  = mean;
+        if (strcmp(modes[m].name, "n-gram-only") == 0) ngram_mean = mean;
+    }
+    printf("-----------------------------------------------------------\n");
+    double trmean = 0.0;
+    for (int s = 0; s < nseeds; s++) trmean += trf[s];
+    trmean /= nseeds;
+    printf("reference: full train_CE=%.3f  val=%.3f  -> overfit gap %+.3f\n",
+           trmean, full_mean, full_mean - trmean);
+    double delta = ngram_mean - full_mean;   /* >0 => full lower CE => learns beyond n-gram */
+    printf("verdict: full vs n-gram-only  dCE=%+.3f  -> full %s\n",
+           delta, delta > 1e-3 ? "LOWER: learns beyond n-gram"
+                : (delta < -1e-3 ? "HIGHER: worse than n-gram" : "TIED with n-gram"));
+    return 0;
+}
+
+/* ============================================================ */
 /*  main                                                         */
 /* ============================================================ */
+
+static int is_uint_arg(const char *s) {
+    if (!s || !*s) return 0;
+    for (; *s; s++) if (*s < '0' || *s > '9') return 0;
+    return 1;
+}
 
 int main(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "--test") == 0) return run_test();
 
     if (strcmp(argv[1], "--gradcheck") == 0) return gradcheck();
+
+    if (strcmp(argv[1], "--eval") == 0) {
+        /* --eval [corpus.txt] [nseeds]  |  --eval [nseeds]  (manifest corpus) */
+        const char *corpus = NULL; int nseeds = 5; int ai = 2;
+        if (argc > ai && !is_uint_arg(argv[ai])) corpus = argv[ai++];
+        if (argc > ai) nseeds = atoi(argv[ai]);
+        if (corpus) {
+            FILE *f = fopen(corpus, "rb");
+            if (!f) { perror(corpus); return 1; }
+            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            if (sz <= 0) { fprintf(stderr, "empty corpus\n"); fclose(f); return 1; }
+            char *txt = malloc((size_t)sz + 1u);
+            if (!txt) { fprintf(stderr, "malloc failed\n"); fclose(f); return 1; }
+            sz = (long)fread(txt, 1, (size_t)sz, f); txt[sz] = 0; fclose(f);
+            int rc = run_eval(txt, (int)sz, nseeds);
+            free(txt);
+            return rc;
+        }
+        return run_eval(manifest, (int)strlen(manifest), nseeds);
+    }
 
     if (strcmp(argv[1], "train") == 0 && argc >= 4) {
         srand(42);
@@ -1347,9 +1524,11 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
             "usage: %s --test\n"
+            "       %s --eval [corpus.txt] [nseeds]\n"
+            "       %s --gradcheck\n"
             "       %s train  corpus.txt model.janus [epochs]\n"
             "       %s infer  model.janus 'prompt' [tokens]\n"
             "       %s --noweights corpus.txt 'prompt'\n",
-            argv[0], argv[0], argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 1;
 }
