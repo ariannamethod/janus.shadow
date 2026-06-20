@@ -1,4 +1,4 @@
-# Janus Shadow Mechanism Attention
+# Janus Shadow Mechanism Attention by Arianna Method
 
 **Janus Shadow Mechanism Attention** is a post-transformer written in a single C file. It preserves the standard transformer path—embeddings, learned `Q/K/V`, causal attention, output projection, residual stream, and unembedding—while adding a stateful “shadow” that changes attention according to what has already been read.
 
