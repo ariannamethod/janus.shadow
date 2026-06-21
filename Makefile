@@ -4,6 +4,15 @@ CC     ?= cc
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
 LDLIBS := -lm
 UNAME_M := $(shell uname -m)
+UNAME_S := $(shell uname -s)
+
+# OpenMP flags for the threaded matvec build (`make threads`). Apple clang needs
+# keg-only libomp via -Xpreprocessor; Linux gcc/clang take -fopenmp natively.
+ifeq ($(UNAME_S),Darwin)
+  OMP_FLAGS := -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp
+else
+  OMP_FLAGS := -fopenmp
+endif
 
 ifneq ($(PORTABLE),1)
   ifeq ($(UNAME_M),arm64)
@@ -32,7 +41,11 @@ portable:
 fast-x86:
 	$(MAKE) FAST_X86=1 clean $(BIN)
 
+# multi-core matvec via OpenMP (bit-identical to single-thread; for the big runs)
+threads: $(SRC)
+	$(CC) $(CFLAGS) $(OMP_FLAGS) $(SRC) $(LDLIBS) -o $(BIN)
+
 clean:
 	rm -f $(BIN)
 
-.PHONY: test portable fast-x86 clean
+.PHONY: test portable fast-x86 threads clean

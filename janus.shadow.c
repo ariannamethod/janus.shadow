@@ -434,7 +434,33 @@ static float mag_Wu(void) {
  * NEON mirrors arianna2arianna.c; AVX2 mirrors notorch_simd.h. */
 static void vecmat(float *out, const float *x, const float *W, int I, int J, int stride) {
     for (int j = 0; j < J; j++) out[j] = 0.0f;
+#ifdef _OPENMP
+    /* Thread over output-column blocks. Each out[j] is still summed over i in the
+     * same order, and the block size (64) is a multiple of the SIMD width, so the
+     * 4-/8-wide grouping is preserved -> the result is bit-identical to the
+     * single-thread SIMD path, just split across cores (no races: disjoint j). */
+    /* only the large projections (Wu: J=vocab) are worth threading; small D-by-D
+     * matvecs would lose to parallel-region spawn overhead, so gate on J. */
+    #pragma omp parallel for schedule(static) if(J >= 1024)
+    for (int jb = 0; jb < J; jb += 64) {
+        int je = jb + 64; if (je > J) je = J;
+        for (int i = 0; i < I; i++) {
+            const float *row = W + (long)i * stride;
+            float xi = x[i];
+            int j = jb;
 #if defined(Q_NEON)
+            float32x4_t xbv = vdupq_n_f32(xi);
+            for (; j + 4 <= je; j += 4)
+                vst1q_f32(out + j, vfmaq_f32(vld1q_f32(out + j), xbv, vld1q_f32(row + j)));
+#elif defined(Q_AVX2)
+            __m256 xbv = _mm256_set1_ps(xi);
+            for (; j + 8 <= je; j += 8)
+                _mm256_storeu_ps(out + j, _mm256_fmadd_ps(xbv, _mm256_loadu_ps(row + j), _mm256_loadu_ps(out + j)));
+#endif
+            for (; j < je; j++) out[j] += xi * row[j];
+        }
+    }
+#elif defined(Q_NEON)
     for (int i = 0; i < I; i++) {
         float32x4_t xb = vdupq_n_f32(x[i]);
         const float *row = W + (long)i * stride;
@@ -961,17 +987,45 @@ static float train_loop(int *data, int dn, int steps, int seq_per_step, int prin
 /*  Generation                                                   */
 /* ============================================================ */
 
+/* Greedy by default (JS_TEMP unset/0 -> deterministic, --test & weightless byte-identical).
+ * JS_TEMP>0 enables temperature sampling, which breaks greedy repetition loops; sampling
+ * also applies a stronger recent-repeat penalty. */
 static int pick_topk(float *prob, int *recent_ctx, int rn) {
-    int best = 0; float best_score = -1e30f;
-    for (int v = 0; v < V; v++) {
-        /* Text-mode safeguard: raw byte tokens for control chars are legal BPE
-         * vocabulary entries, but usually poisonous for text generation. */
-        if (v < 32 || v == 127) continue;
-        float s = logf(prob[v] + 1e-9f) - 0.18f * logf(1.0f + tr[v]);
-        for (int j = 0; j < rn; j++) if (recent_ctx[j] == v) { s -= 0.40f; break; }
-        if (s > best_score) { best_score = s; best = v; }
+    static float g_temp = -1.0f;
+    if (g_temp < 0.0f) {
+        const char *t = getenv("JS_TEMP");
+        g_temp = t ? (float)atof(t) : 0.0f;
+        if (!(g_temp > 0.0f)) g_temp = 0.0f;   /* NaN / negative / unset -> greedy */
     }
-    return best;
+    float rep = (g_temp > 0.0f) ? 1.2f : 0.40f;   /* harder anti-repeat when sampling */
+    static float sc[VMAX];
+    for (int v = 0; v < V; v++) {
+        /* control-char byte tokens are legal BPE entries but poison text generation */
+        if (v < 32 || v == 127) { sc[v] = -1e30f; continue; }
+        float s = logf(prob[v] + 1e-9f) - 0.18f * logf(1.0f + tr[v]);
+        for (int j = 0; j < rn; j++) if (recent_ctx[j] == v) { s -= rep; break; }
+        sc[v] = s;
+    }
+    if (g_temp <= 0.0f) {   /* greedy argmax (default) — identical selection to the old code */
+        int best = 0; float bs = -1e30f;
+        for (int v = 0; v < V; v++) if (sc[v] > bs) { bs = sc[v]; best = v; }
+        return best;
+    }
+    /* temperature softmax over the penalised scores, then sample */
+    float mx = -1e30f;
+    for (int v = 0; v < V; v++) if (sc[v] > mx) mx = sc[v];
+    static float p2[VMAX];
+    float z = 0.0f;
+    for (int v = 0; v < V; v++) { p2[v] = (sc[v] <= -1e29f) ? 0.0f : expf((sc[v] - mx) / g_temp); z += p2[v]; }
+    if (z <= 0.0f) {        /* degenerate -> greedy fallback */
+        int best = 0; float bs = -1e30f;
+        for (int v = 0; v < V; v++) if (sc[v] > bs) { bs = sc[v]; best = v; }
+        return best;
+    }
+    float u = rfu() * z, acc = 0.0f;
+    for (int v = 0; v < V; v++) { acc += p2[v]; if (acc > u) return v; }   /* '>' skips zero-prob (banned) buckets even at u==0 */
+    /* unreachable for u in [0,z); greedy fallback for safety */
+    { int best = 0; float bs = -1e30f; for (int v = 0; v < V; v++) if (sc[v] > bs) { bs = sc[v]; best = v; } return best; }
 }
 
 static void generate(const char *prompt, int n_out, FILE *out_f) {
@@ -1003,23 +1057,24 @@ static void generate(const char *prompt, int n_out, FILE *out_f) {
 static int save_model(const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
-    fwrite("JSHD01", 1, 6, f);
-    fwrite(&V, sizeof V, 1, f);
-    fwrite(L, sizeof L[0], VMAX, f);
-    fwrite(R, sizeof R[0], VMAX, f);
-    fwrite(E,  sizeof E[0][0],  VMAX * D, f);
-    fwrite(Wq, sizeof Wq[0][0], D * D, f);
-    fwrite(Wk, sizeof Wk[0][0], D * D, f);
-    fwrite(Wv, sizeof Wv[0][0], D * D, f);
-    fwrite(Wo, sizeof Wo[0][0], D * D, f);
-    fwrite(Wu, sizeof Wu[0][0], D * VMAX, f);
-    fwrite(bi_count,   sizeof bi_count[0][0], VMAX * VMAX, f);
-    fwrite(bi_row_sum, sizeof bi_row_sum[0],  VMAX, f);
-    fwrite(tri_key,    sizeof tri_key[0],     HSZ, f);
-    fwrite(tri_cnt,    sizeof tri_cnt[0],     HSZ, f);
-    fwrite(tr,         sizeof tr[0],          VMAX, f);
-    fclose(f);
-    return 1;
+    int ok = 1;   /* every fwrite must place all elements, else the checkpoint is not trustworthy */
+    ok &= (fwrite("JSHD01", 1, 6, f) == 6);
+    ok &= (fwrite(&V, sizeof V, 1, f) == 1);
+    ok &= (fwrite(L, sizeof L[0], VMAX, f) == (size_t)VMAX);
+    ok &= (fwrite(R, sizeof R[0], VMAX, f) == (size_t)VMAX);
+    ok &= (fwrite(E,  sizeof E[0][0],  (size_t)VMAX * D, f) == (size_t)VMAX * D);
+    ok &= (fwrite(Wq, sizeof Wq[0][0], (size_t)D * D, f) == (size_t)D * D);
+    ok &= (fwrite(Wk, sizeof Wk[0][0], (size_t)D * D, f) == (size_t)D * D);
+    ok &= (fwrite(Wv, sizeof Wv[0][0], (size_t)D * D, f) == (size_t)D * D);
+    ok &= (fwrite(Wo, sizeof Wo[0][0], (size_t)D * D, f) == (size_t)D * D);
+    ok &= (fwrite(Wu, sizeof Wu[0][0], (size_t)D * VMAX, f) == (size_t)D * VMAX);
+    ok &= (fwrite(bi_count,   sizeof bi_count[0][0], (size_t)VMAX * VMAX, f) == (size_t)VMAX * VMAX);
+    ok &= (fwrite(bi_row_sum, sizeof bi_row_sum[0],  VMAX, f) == (size_t)VMAX);
+    ok &= (fwrite(tri_key,    sizeof tri_key[0],     HSZ, f) == (size_t)HSZ);
+    ok &= (fwrite(tri_cnt,    sizeof tri_cnt[0],     HSZ, f) == (size_t)HSZ);
+    ok &= (fwrite(tr,         sizeof tr[0],          VMAX, f) == (size_t)VMAX);
+    if (fclose(f) != 0) ok = 0;
+    return ok;
 }
 
 static void rebuild_tok_str(void) {
@@ -1467,7 +1522,7 @@ static int run_eval(const char *text, int textlen, int nseeds) {
 /* Held-out CE on four diagnostic modes so hybrid-masking (the always-on n-gram
  * path hiding a non-learning neural path) is visible during training. eval_ce
  * restores the training life-state; this restores the training logit mode. */
-static void train_val_report(int step, const int *val, int vn) {
+static double train_val_report(int step, const int *val, int vn) {
     struct { const char *n; int tr, ne, bg, tg, trc; float a; } M[] = {
         {"full",     1, 1, 1, 1, 1, ALPHA},
         {"ngram",    1, 0, 1, 1, 0, ALPHA},
@@ -1475,13 +1530,17 @@ static void train_val_report(int step, const int *val, int vn) {
         {"noshadow", 1, 1, 1, 1, 0, 0.0f},
     };
     int vc = (vn > VAL_CAP) ? VAL_CAP : vn;   /* bound val cost regardless of corpus size */
+    double full_ce = 0.0;
     printf("  [val@%d]", step);
     for (int m = 0; m < 4; m++) {
         eval_set_mode(M[m].tr, M[m].ne, M[m].bg, M[m].tg, M[m].trc, M[m].a);
-        printf("  %s %.3f", M[m].n, eval_ce(val, vc));
+        double ce = eval_ce(val, vc);
+        if (m == 0) full_ce = ce;   /* "full" mode CE drives best-checkpoint tracking */
+        printf("  %s %.3f", M[m].n, ce);
     }
     printf("\n");
     eval_set_mode(1, 1, 1, 1, 1, ALPHA);   /* back to training mode */
+    return full_ce;
 }
 
 /* The real training loop: `steps` steps of `seq_per_step` sequences each,
@@ -1496,6 +1555,7 @@ static float train_run(int *data, int dn, const int *val, int vn,
     LIFE_READY = 0; coherence = 1.0f; q_coherence = 1.0f;
 
     float last = 0.0f;
+    double best_val = 1e30;   /* best held-out full-mode CE (double: no float rounding) -> save only on improvement */
     for (int step = 0; step < steps; step++) {
         float bl = 0.0f;
         for (int s = 0; s < seq_per_step; s++) {
@@ -1516,8 +1576,14 @@ static float train_run(int *data, int dn, const int *val, int vn,
         if (step % 100 == 0 || step == steps - 1)
             printf("step %5d | loss %.4f | gate %.2f qcoh %.2f\n", step, bl, gate_c, q_coherence);
         if (ckpt_interval > 0 && (step == steps - 1 || (step > 0 && step % ckpt_interval == 0))) {
-            if (ckpt_path && save_model(ckpt_path)) printf("  [ckpt %s @ %d]\n", ckpt_path, step);
-            if (val && vn > 1) train_val_report(step, val, vn);
+            if (val && vn > 1) {
+                double vfull = train_val_report(step, val, vn);
+                if (ckpt_path && vfull < best_val) {   /* keep the BEST model, not the last */
+                    if (save_model(ckpt_path)) { best_val = vfull; printf("  [best ckpt %s @ %d | val %.3f]\n", ckpt_path, step, vfull); }
+                }
+            } else if (ckpt_path && save_model(ckpt_path)) {
+                printf("  [ckpt %s @ %d]\n", ckpt_path, step);   /* no held-out val: keep latest */
+            }
         }
     }
     return last;
@@ -1583,9 +1649,9 @@ int main(int argc, char **argv) {
         stats_build(data, n);
         float fl = train_run(data, n, vdata, vn, steps, seqp, argv[3], CKPT_INTERVAL);
         if (isnan(fl) || isinf(fl))
-            fprintf(stderr, "training diverged (NaN/Inf) -- last good checkpoint kept, not overwriting\n");
-        else if (save_model(argv[3])) printf("saved: %s\n", argv[3]);
-        else fprintf(stderr, "save failed: %s\n", argv[3]);
+            fprintf(stderr, "training diverged (NaN/Inf) -- best checkpoint kept\n");
+        else
+            printf("done -- best checkpoint saved to %s\n", argv[3]);
         free(txt);
         return 0;
     }
